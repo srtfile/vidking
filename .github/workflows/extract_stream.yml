@@ -1,0 +1,112 @@
+name: Extract Stream URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      tmdb_id:
+        description: "TMDB ID (e.g. 76479 for a TV show, 550 for a movie)"
+        required: true
+        type: string
+
+      media_type:
+        description: "Media type"
+        required: true
+        default: "tv"
+        type: choice
+        options:
+          - tv
+          - movie
+
+      season:
+        description: "Season number (TV only)"
+        required: false
+        default: "1"
+        type: string
+
+      episode:
+        description: "Episode number (TV only)"
+        required: false
+        default: "1"
+        type: string
+
+      use_playwright:
+        description: "Use Playwright browser fallback if direct API fails"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  extract:
+    name: Extract Stream URL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests playwright
+
+      - name: Install Playwright Chromium
+        if: ${{ inputs.use_playwright == true }}
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run stream extractor
+        id: extract
+        run: |
+          python extractor.py \
+            --tmdb "${{ inputs.tmdb_id }}" \
+            --type "${{ inputs.media_type }}" \
+            --season "${{ inputs.season }}" \
+            --episode "${{ inputs.episode }}" \
+            ${{ inputs.use_playwright == false && '--playwright-only false' || '' }} \
+            | tee output.txt
+
+          # Capture first .m3u8 or .mpd URL found into a GitHub output variable
+          STREAM_URL=$(grep -Eo 'https?://[^ ]+\.(m3u8|mpd)[^ ]*' output.txt | head -1 || true)
+          echo "stream_url=$STREAM_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Print result summary
+        run: |
+          echo "### 🎬 Stream Extraction Result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| TMDB ID | \`${{ inputs.tmdb_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | ${{ inputs.media_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Season | ${{ inputs.season }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Episode | ${{ inputs.episode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "${{ steps.extract.outputs.stream_url }}" ]; then
+            echo "✅ **Stream URL found:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.extract.outputs.stream_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **No stream URL found.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary>Full extractor output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat output.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-urls-tmdb${{ inputs.tmdb_id }}-s${{ inputs.season }}e${{ inputs.episode }}
+          path: output.txt
+          retention-days: 7

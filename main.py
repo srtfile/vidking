@@ -1,21 +1,23 @@
+"""
+vidking.net m3u8 / stream URL extractor
+Adapted for GitHub Actions — manual workflow_dispatch trigger.
+
+Usage (GitHub Actions inputs are passed as CLI args):
+  python extractor.py --tmdb 76479 --type tv --season 5 --episode 8
+  python extractor.py --tmdb 550   --type movie
+  python extractor.py --url "https://www.vidking.net/embed/tv/76479/5/8/"
+"""
+
+import argparse
 import asyncio
+import json
 import re
+import sys
 import time
+
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
 
-app = FastAPI(title="Vidking Extractor API")
-
-# Allow cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+DEFAULT_URL = "https://www.vidking.net/embed/tv/76479/5/8/"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,8 +36,25 @@ BASE_HEADERS = {
     "sec-fetch-site": "cross-site",
 }
 
+
 # ─────────────────────────────────────────────
-# Core Extraction Logic
+# Helpers
+# ─────────────────────────────────────────────
+
+def log(msg: str):
+    """Print with flush so GitHub Actions captures output in real time."""
+    print(msg, flush=True)
+
+
+def parse_embed_url(url: str):
+    m = re.search(r"/embed/(tv|movie)/(\d+)(?:/(\d+)/(\d+))?", url)
+    if not m:
+        raise ValueError(f"Cannot parse embed URL: {url}")
+    return m.group(1), m.group(2), m.group(3), m.group(4)
+
+
+# ─────────────────────────────────────────────
+# Metadata
 # ─────────────────────────────────────────────
 
 def get_show_meta(tmdb_id: str, media_type: str = "tv"):
@@ -54,11 +73,18 @@ def get_show_meta(tmdb_id: str, media_type: str = "tv"):
     return title, year, imdb_id
 
 
-def try_direct_api(media_type: str, tmdb_id: str, season: str = "", episode: str = "") -> list:
+# ─────────────────────────────────────────────
+# Direct API extraction
+# ─────────────────────────────────────────────
+
+def try_direct_api(
+    media_type: str, tmdb_id: str, season: str, episode: str
+) -> list:
     try:
         title, year, imdb_id = get_show_meta(tmdb_id, media_type)
+        log(f"[*] Metadata: title={title!r}  year={year}  imdb={imdb_id}")
     except Exception as e:
-        print(f"[warn] Metadata fetch failed: {e}")
+        log(f"[warn] Metadata fetch failed: {e}")
         title, year, imdb_id = "", "", ""
 
     params = {
@@ -73,6 +99,7 @@ def try_direct_api(media_type: str, tmdb_id: str, season: str = "", episode: str
         params["episodeId"] = episode
         params["seasonId"] = season
 
+    log("[*] Calling sources API …")
     r = requests.get(
         "https://api.videasy.net/mb-flix/sources-with-title",
         params=params,
@@ -80,6 +107,7 @@ def try_direct_api(media_type: str, tmdb_id: str, season: str = "", episode: str
         timeout=20,
     )
 
+    log(f"[*] Sources API status: {r.status_code}")
     if r.status_code != 200:
         return []
 
@@ -90,16 +118,17 @@ def try_direct_api(media_type: str, tmdb_id: str, season: str = "", episode: str
     return list(dict.fromkeys(urls))
 
 
-async def extract_with_playwright(embed_url: str, timeout: int = 30) -> list:
+# ─────────────────────────────────────────────
+# Playwright fallback
+# ─────────────────────────────────────────────
+
+async def extract_with_playwright(embed_url: str, timeout: int = 45) -> list:
     from playwright.async_api import async_playwright
+
     found = []
 
     async with async_playwright() as p:
-        # Chromium args optimized for cloud deployment (Render)
-        browser = await p.chromium.launch(
-            headless=True, 
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
+        browser = await p.chromium.launch(headless=True)
         ctx = await browser.new_context(
             user_agent=UA,
             extra_http_headers={"accept-language": "en-US,en;q=0.9"},
@@ -110,70 +139,115 @@ async def extract_with_playwright(embed_url: str, timeout: int = 30) -> list:
             url = response.url
             if re.search(r'\.(m3u8|mpd)(\?|$)', url):
                 if url not in found:
+                    log(f"[+] Intercepted stream: {url}")
                     found.append(url)
             if "sources-with-title" in url and response.status == 200:
                 try:
                     body = await response.body()
                     text = body.decode("utf-8", errors="ignore")
-                    for u in re.findall(r'https?://[^\s"\'\\<>]+\.m3u8[^\s"\'\\<>]*', text):
-                        if u not in found: found.append(u)
-                    for u in re.findall(r'https?://[^\s"\'\\<>]+\.mpd[^\s"\'\\<>]*', text):
-                        if u not in found: found.append(u)
+                    for u in re.findall(
+                        r'https?://[^\s"\'\\<>]+\.m3u8[^\s"\'\\<>]*', text
+                    ):
+                        if u not in found:
+                            found.append(u)
+                    for u in re.findall(
+                        r'https?://[^\s"\'\\<>]+\.mpd[^\s"\'\\<>]*', text
+                    ):
+                        if u not in found:
+                            found.append(u)
                 except Exception:
                     pass
 
         page.on("response", on_response)
-        
-        try:
-            await page.goto(embed_url, wait_until="networkidle", timeout=timeout * 1000)
-            deadline = time.time() + 10
-            while not found and time.time() < deadline:
-                await page.wait_for_timeout(1000)
-        except Exception as e:
-            print(f"Playwright navigation error: {e}")
-        finally:
-            await browser.close()
+
+        log(f"[*] Playwright loading: {embed_url}")
+        await page.goto(
+            embed_url, wait_until="networkidle", timeout=timeout * 1000
+        )
+
+        deadline = time.time() + 15
+        while not found and time.time() < deadline:
+            await page.wait_for_timeout(1000)
+
+        await browser.close()
 
     return found
 
 
-async def get_stream_urls(media_type: str, tmdb_id: str, season: str = "", episode: str = ""):
-    # 1. Try Direct API (running blocking requests in a separate thread)
-    urls = await asyncio.to_thread(try_direct_api, media_type, tmdb_id, season, episode)
-    
-    # 2. Fallback to Playwright
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract m3u8/mpd stream URLs from vidking.net"
+    )
+    parser.add_argument("--url", default=None, help="Full embed URL")
+    parser.add_argument("--tmdb", help="TMDB ID")
+    parser.add_argument(
+        "--type", dest="media_type", default="tv", choices=["tv", "movie"]
+    )
+    parser.add_argument("--season", default="1")
+    parser.add_argument("--episode", default="1")
+    parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument(
+        "--playwright-only",
+        action="store_true",
+        help="Skip direct API and go straight to Playwright",
+    )
+    args = parser.parse_args()
+
+    # Build embed URL from TMDB or parse from --url
+    if args.tmdb:
+        media_type = args.media_type
+        tmdb_id = args.tmdb
+        season = args.season
+        episode = args.episode
+        embed_url = (
+            f"https://www.vidking.net/embed/{media_type}/{tmdb_id}"
+            + (f"/{season}/{episode}/" if media_type == "tv" else "/")
+        )
+    elif args.url:
+        embed_url = args.url
+        media_type, tmdb_id, season, episode = parse_embed_url(embed_url)
+    else:
+        embed_url = DEFAULT_URL
+        media_type, tmdb_id, season, episode = parse_embed_url(embed_url)
+
+    log(f"[*] Target : {embed_url}")
+    log(f"[*] Type={media_type}  TMDB={tmdb_id}  S={season}  E={episode}")
+
+    urls = []
+
+    # ── Step 1: direct API (unless --playwright-only)
+    if not args.playwright_only:
+        log("\n[*] Attempting direct API extraction …")
+        urls = try_direct_api(media_type, tmdb_id, season, episode)
+
+    # ── Step 2: Playwright fallback
     if not urls:
-        embed_url = f"https://www.vidking.net/embed/{media_type}/{tmdb_id}"
-        embed_url += f"/{season}/{episode}/" if media_type == "tv" else "/"
-        
+        log("\n[*] Direct API returned no stream URLs — launching Playwright …")
         try:
-            urls = await extract_with_playwright(embed_url)
+            urls = asyncio.run(
+                extract_with_playwright(embed_url, timeout=args.timeout)
+            )
+        except ImportError:
+            log("[!] Playwright not installed.")
+            log("    pip install playwright && playwright install chromium")
+            sys.exit(1)
         except Exception as e:
-            print(f"[!] Playwright failed: {e}")
-            
-    return urls
+            log(f"[!] Playwright error: {e}")
+            sys.exit(1)
 
-# ─────────────────────────────────────────────
-# API Routes (Redirects to Video)
-# ─────────────────────────────────────────────
-
-@app.get("/tv/{tmdb_id}/{season}/{episode}/")
-@app.get("/tv/{tmdb_id}/{season}/{episode}")
-async def get_tv(tmdb_id: str, season: str, episode: str):
-    urls = await get_stream_urls("tv", tmdb_id, season, episode)
-    if not urls:
-        raise HTTPException(status_code=404, detail="No stream URLs found.")
-    
-    # Redirect directly to the stream URL
-    return RedirectResponse(url=urls[0], status_code=302)
+    # ── Output
+    if urls:
+        log(f"\n[+] Found {len(urls)} stream URL(s):\n")
+        for u in urls:
+            log(u)
+    else:
+        log("\n[-] No stream URLs found.")
+        sys.exit(1)
 
 
-@app.get("/movie/{tmdb_id}/")
-@app.get("/movie/{tmdb_id}")
-async def get_movie(tmdb_id: str):
-    urls = await get_stream_urls("movie", tmdb_id)
-    if not urls:
-        raise HTTPException(status_code=404, detail="No stream URLs found.")
-    
-    # Redirect directly to the stream URL
-    return RedirectResponse(url=urls[0], status_code=302)
+if __name__ == "__main__":
+    main()

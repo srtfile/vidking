@@ -4,10 +4,11 @@ import time
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 app = FastAPI(title="Vidking Extractor API")
 
-# Allow cross-origin requests if you plan to call this from a frontend
+# Allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,7 +35,7 @@ BASE_HEADERS = {
 }
 
 # ─────────────────────────────────────────────
-# Core Logic
+# Core Extraction Logic
 # ─────────────────────────────────────────────
 
 def get_show_meta(tmdb_id: str, media_type: str = "tv"):
@@ -51,6 +52,7 @@ def get_show_meta(tmdb_id: str, media_type: str = "tv"):
     year = (data.get("first_air_date") or data.get("release_date") or "")[:4]
     imdb_id = (data.get("external_ids") or {}).get("imdb_id", "")
     return title, year, imdb_id
+
 
 def try_direct_api(media_type: str, tmdb_id: str, season: str = "", episode: str = "") -> list:
     try:
@@ -87,13 +89,17 @@ def try_direct_api(media_type: str, tmdb_id: str, season: str = "", episode: str
         urls = re.findall(r'https?://[^\s"\'\\<>]+\.mpd[^\s"\'\\<>]*', text)
     return list(dict.fromkeys(urls))
 
+
 async def extract_with_playwright(embed_url: str, timeout: int = 30) -> list:
     from playwright.async_api import async_playwright
     found = []
 
     async with async_playwright() as p:
-        # args=["--no-sandbox", "--disable-setuid-sandbox"] are highly recommended for cloud deployments like Render
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+        # Chromium args optimized for cloud deployment (Render)
+        browser = await p.chromium.launch(
+            headless=True, 
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
         ctx = await browser.new_context(
             user_agent=UA,
             extra_http_headers={"accept-language": "en-US,en;q=0.9"},
@@ -130,6 +136,7 @@ async def extract_with_playwright(embed_url: str, timeout: int = 30) -> list:
 
     return found
 
+
 async def get_stream_urls(media_type: str, tmdb_id: str, season: str = "", episode: str = ""):
     # 1. Try Direct API (running blocking requests in a separate thread)
     urls = await asyncio.to_thread(try_direct_api, media_type, tmdb_id, season, episode)
@@ -147,7 +154,7 @@ async def get_stream_urls(media_type: str, tmdb_id: str, season: str = "", episo
     return urls
 
 # ─────────────────────────────────────────────
-# API Routes
+# API Routes (Redirects to Video)
 # ─────────────────────────────────────────────
 
 @app.get("/tv/{tmdb_id}/{season}/{episode}/")
@@ -156,7 +163,9 @@ async def get_tv(tmdb_id: str, season: str, episode: str):
     urls = await get_stream_urls("tv", tmdb_id, season, episode)
     if not urls:
         raise HTTPException(status_code=404, detail="No stream URLs found.")
-    return {"type": "tv", "tmdb_id": tmdb_id, "season": season, "episode": episode, "urls": urls}
+    
+    # Redirect directly to the stream URL
+    return RedirectResponse(url=urls[0], status_code=302)
 
 
 @app.get("/movie/{tmdb_id}/")
@@ -165,4 +174,6 @@ async def get_movie(tmdb_id: str):
     urls = await get_stream_urls("movie", tmdb_id)
     if not urls:
         raise HTTPException(status_code=404, detail="No stream URLs found.")
-    return {"type": "movie", "tmdb_id": tmdb_id, "urls": urls}
+    
+    # Redirect directly to the stream URL
+    return RedirectResponse(url=urls[0], status_code=302)
